@@ -22,7 +22,7 @@ propulsion differs (EDF + ESC instead of a CO2 ball valve), never for style.
 | Flight computer | Heltec WiFi LoRa 32 V3 (ESP32-S3) — ONE board, no second board |
 | Sensors | BMP388 (baro), MPU6050 (IMU), VL53L1X (ToF) — all I2C |
 | TVC | Gimbaled exhaust nozzle, 2× MG90S servos |
-| Telemetry | WiFi SoftAP + UDP to a ground laptop (LoRa radio present but unused) |
+| Telemetry | WiFi SoftAP + served web control/telemetry page (LoRa present but unused) |
 | All-up weight | ~970–1000 g |
 | T/W (bench) | ~2.2 |
 | T/W (real, 15% intake loss) | ~1.9 |
@@ -33,10 +33,14 @@ propulsion differs (EDF + ESC instead of a CO2 ball valve), never for style.
 Everything shares a common ground.
 
 **Telemetry architecture:** one ESP32. The board hosts a WiFi SoftAP
-("Zephyr-Telemetry") and streams flight data over UDP. A ground-station **laptop**
-joins the AP and records the stream (`nc -ul 4210 > flight.csv`) — there is no
-second flight computer and no LoRa link. The on-board SX1262 LoRa radio is left
-disabled (enabling it locks its internal SPI GPIOs that we want free for spares).
+("Zephyr-Telemetry") and **serves a control/telemetry web page** at
+`http://192.168.4.1`. A phone or laptop joins the AP, opens the page, and gets
+live telemetry plus arm / launch / abort buttons — no second flight computer and
+no LoRa link. **The radio is a convenience layer only:** the web server runs in
+its own task and shares just a telemetry snapshot and a few command flags with
+the control loop, which never blocks on or waits for anything network-related.
+WiFi can never affect onboard flight logic. The on-board SX1262 LoRa radio is
+left disabled (enabling it locks internal SPI GPIOs we want free for spares).
 
 ---
 
@@ -54,14 +58,16 @@ in the airframe. Never fly anything you haven't bench-tested.
    *Do not proceed until all three read correctly.*
 
 ### Step 2 — Build the 5V power rail
-You have ONE 5V source (the ESC's BEC) feeding THREE loads (ESP32 + 2 servos).
-Build a shared rail — do not daisy-chain.
+You have ONE 5V source (the ESC's BEC) feeding FOUR loads (ESP32 + 2 servos + the
+ESC signal level-shifter chip). Build a shared rail — do not daisy-chain.
 1. Make a small "+5V" node and a "GND" node (perfboard strip, or a soldered star,
    or a servo Y-harness).
 2. BEC red (5V) → +5V node. BEC black (GND) → GND node.
-3. From +5V node: branch to ESP32 5V pin, servo1 +, servo2 +.
-4. From GND node: branch to ESP32 GND, servo1 −, servo2 −, AND sensor GND.
-5. BEC current budget: 5V/5A. ESP32 ~0.3A + 2× MG90S ~1.4A peak = ~1.7A. Big margin.
+3. From +5V node: branch to ESP32 5V pin, servo1 +, servo2 +, 74AHCT125N VCC (pin 14).
+4. From GND node: branch to ESP32 GND, servo1 −, servo2 −, 74AHCT125N GND (pin 7),
+   AND sensor GND.
+5. BEC current budget: 5V/5A. ESP32 ~0.3A + 2× MG90S ~1.4A peak + buffer (~µA,
+   negligible) = ~1.7A. Big margin.
 
 **Critical:** every ground in the system ties to the GND node — ESC, ESP32,
 servos, sensors. A floating ground = jittery/dead PWM. This is the #1 first-build
@@ -69,7 +75,10 @@ failure.
 
 ### Step 3 — ESC + motor bench test (FAN RESTRAINED)
 1. Connect ESC three phase wires to the EDF motor (bullet plugs).
-2. ESC signal wire → designated ESP32 GPIO (throttle).
+2. ESC signal wire → 74AHCT125N output (pin 1Y); the chip's input (pin 1A) ←
+   GPIO 6, with a 10k pulldown GPIO 6 → GND. The ESP32's 3.3V PWM will NOT arm the
+   ESC directly — the buffer lifts it to 5V (see wiring-diagram.md). GPIO 6, not
+   47/48 (USB-UART noisy).
 3. ESC power → 6S battery via XT60. **Do not plug battery in yet.**
 4. **Clamp the EDF unit to the bench. Clear all loose wires, fingers, hair.**
    At 65A this fan spins to tens of thousands of RPM.
@@ -91,15 +100,17 @@ failure.
 ### Step 5 — Assemble the TVC stage
 1. Mount the EDF unit fixed in the lower airframe.
 2. Mount the gimbaled nozzle in the exhaust, just aft of the fan.
-3. Mount the 2 servos in the bracket: servo1 = pitch, servo2 = yaw.
+3. Mount the 2 servos in the bracket: servo1 = pitch, servo2 = roll.
 4. Connect servo horns to nozzle arms with 1.2mm steel pushrods.
-5. With servos powered and centered (1500µs), adjust pushrod length so the
-   nozzle sits exactly centered/straight. This is your mechanical zero.
-6. Confirm ±12° travel in pitch and yaw with no binding through full range.
+5. With servos powered and at their per-axis center pulse (`cfg::TVC_PITCH_CENTER_US`
+   / `TVC_ROLL_CENTER_US`, bench-measured ~1600/1700µs — the two axes differ), adjust
+   pushrod length so the nozzle sits exactly centered/straight. This is mechanical zero.
+6. Confirm full ±20° mechanical travel in pitch and roll with no binding (the firmware
+   clamps well inside this — see `cfg::TVC_CLAMP_DEG`, ±10° during tuning).
 
 ### Step 6 — Airframe integration (layout top→bottom)
 ```
-[ Nose cone + parachute + recovery ]
+[ Nose cone (no chute — propulsive land) ]
 [ Payload bay: Heltec + 3 sensors   ]   ← electronics
 [ Air intake holes (ring of holes)  ]   ← total inlet area >= fan area (~38 cm2 for 70mm)
 [ 6S battery                        ]   ← heavy item, mid-body
@@ -114,10 +125,15 @@ failure.
 4. Verify CoM is above the nozzle pivot by a healthy margin (longer = more
    control authority).
 
-### Step 7 — Recovery
-1. Parachute sized for ~1 kg at a safe descent rate.
-2. Deployment triggered by the flight computer (apogee detect via baro + IMU).
-3. Bench-test the deployment mechanism independently before flight.
+### Step 7 — Propulsive landing (no parachute)
+Landing is entirely propulsive — there is no parachute and no pyro. After the
+hover, the flight computer ramps the altitude setpoint down (the throttle DESCEND
+phase) and cuts the motor at touchdown.
+1. The downward-facing VL53L1X is the primary altitude reference for the descent;
+   tune `DESCENT_RATE_MS` and `ALT_LANDED_M` in `zephyr_config.h` for a gentle touchdown.
+2. Design the lower airframe / legs to absorb a low-speed powered touchdown.
+3. Verify the descent-then-cut behavior on the test stand (fan clamped, setpoint
+   forced through DESCEND→LANDED) before any free flight.
 
 ---
 
@@ -126,7 +142,7 @@ failure.
 Reuse as much of the SPARC firmware as possible — the module layout under
 `firmware/lib/` is intentionally the same. The TVC control loop is identical; only
 the throttle output changes (servo valve → ESC) and you add an ESC arming
-sequence. Telemetry is WiFi SoftAP + UDP, exactly as on SPARC.
+sequence. Telemetry is a WiFi SoftAP serving a control/telemetry web page.
 
 ### Step 1 — Toolchain
 1. Arduino IDE or PlatformIO with ESP32-S3 board support (Heltec WiFi LoRa 32 V3).
@@ -135,12 +151,14 @@ sequence. Telemetry is WiFi SoftAP + UDP, exactly as on SPARC.
    - `adafruit/Adafruit MPU6050`
    - `adafruit/Adafruit Unified Sensor`
    - `pololu/VL53L1X`
-   - `madhephaestus/ESP32Servo` (NOT the Arduino Servo library)
    - `thingpulse/ESP8266 and ESP32 OLED driver for SSD1306 displays`
-   WiFi is built into the ESP32 Arduino framework — no library needed. No LoRa or
-   SD libraries (LoRa radio left disabled; no SD card).
-3. Use ESP32 hardware PWM via ESP32Servo for BOTH the servos AND the ESC —
-   the ESC reads the same 1000–2000µs signal as a servo.
+   WiFi is built into the ESP32 Arduino framework — no library needed. The ESC and
+   both servos run on native LEDC (built into the core) — no servo library. No LoRa
+   or SD libraries (LoRa radio left disabled; no SD card).
+3. Drive BOTH the servos AND the ESC on native LEDC via `ledcAttachChannel` —
+   explicit channels 0 (ESC) / 1 (pitch) / 2 (roll) sharing one 50 Hz timer. The ESC
+   reads the same 1000–2000µs signal as a servo. Requires arduino-esp32 core 3.x
+   (pioarduino on PlatformIO); ESP32Servo's 3-instance MCPWM combo fails on the S3.
 
 ### Step 2 — Bring-up order (mirror the hardware steps)
 There is no separate `test/` directory — bring-up is done by flashing the main
@@ -150,10 +168,10 @@ this order and confirm it before moving on:
 2. Each sensor individually → confirm data.
 3. Sensor fusion (`lib/fusion`): feed MPU6050 (primary attitude) into your filter;
    baro for altitude; ToF for ground proximity.
-4. Servo sweep → confirm pitch/yaw map to nozzle correctly, set center.
+4. Servo sweep → confirm pitch/roll map to nozzle correctly, set center.
 5. ESC throttle test (FAN CLAMPED) → confirm arming + throttle range.
-6. WiFi telemetry (`lib/wifi_link`) → confirm the laptop joins the SoftAP and
-   receives the UDP stream.
+6. WiFi telemetry (`lib/wifi_link`) → join the SoftAP, open `http://192.168.4.1`,
+   confirm live telemetry and that arm/launch/abort buttons set their flags.
 
 ### Step 3 — ESC arming sequence (the new piece vs the CO2 build)
 An ESC will NOT spin until it sees a minimum-throttle signal at startup.
@@ -164,21 +182,22 @@ Fold this into your existing pre-flight/arm state:
 4. Throttle stays at minimum until launch command.
 
 ### Step 4 — Control loop (reuse from SPARC)
-1. Read IMU → estimate attitude (pitch/yaw error from vertical).
+1. Read IMU → estimate attitude (pitch/roll error from vertical).
 2. PID per axis (`lib/pid`) → desired nozzle deflection.
-3. Clamp deflection to ±12°, map to servo µs (`lib/tvc`), write to both servos.
+3. Clamp deflection to `cfg::TVC_CLAMP_DEG`, map to servo µs (`lib/tvc`, per-axis
+   center + per-side slope), write to both servos.
 4. Throttle (`lib/throttle`): open-loop profile (ramp to launch throttle) OR
    closed-loop on baro-derived velocity, your choice. Start open-loop.
 5. Telemetry (`lib/wifi_link`): stream altitude, attitude, state, servo positions,
-   throttle, battery voltage over WiFi/UDP. OLED blank during flight to save power.
+   throttle, battery voltage to the web page. OLED blank during flight to save power.
 
 ### Step 5 — State machine (`lib/state_machine`)
 ```
 BOOT → SENSOR_CHECK → ARM (ESC arming) → ARMED (on pad, OLED status)
      → LAUNCH (throttle up, TVC active)
-     → FLIGHT (TVC active, telemetry)
-     → APOGEE (deploy recovery)
-     → DESCENT → LANDED (motor cut, log dump)
+     → ASCEND → HOVER (TVC active, telemetry)
+     → DESCEND (powered descent on ToF, TVC active)
+     → LANDED (motor cut, log dump)
 ```
 
 ### Step 6 — Tuning (do NOT skip)
@@ -206,7 +225,7 @@ zephyr/
 ├── .gitignore                 # ignores .pio/, build artifacts, .DS_Store, secrets
 ├── firmware/                  # the PlatformIO project (mirrors SPARC)
 │   ├── include/
-│   │   └── config.h           # PIN MAP, PID gains, limits, I2C addresses (shared header)
+│   │   └── zephyr_config.h    # PIN MAP, PID gains, limits, I2C addresses (shared header)
 │   ├── src/
 │   │   └── main.cpp           # entry point ONLY: setup/loop, wires modules together
 │   └── lib/                   # all modules as project-private PlatformIO libraries
@@ -218,18 +237,22 @@ zephyr/
 │       │   └── attitude.cpp/.h
 │       ├── pid/               # reusable PID controller (per-axis)
 │       │   └── pid.cpp/.h
-│       ├── tvc/               # nozzle mapping, ±12° deflection clamp, servo output
+│       ├── tvc/               # nozzle mapping, TVC_CLAMP_DEG clamp, servo output
 │       │   └── tvc.cpp/.h
-│       ├── throttle/          # ESC arming + throttle profile (EDF-specific)
+│       ├── throttle/          # ESC arming + throttle profile + brownout ramp-down
 │       │   └── throttle.cpp/.h
-│       ├── wifi_link/         # WiFi SoftAP + UDP telemetry downlink
+│       ├── battery/           # 6S pack sense (averaged) + latched brownout policy
+│       │   └── battery.cpp/.h
+│       ├── wifi_link/         # WiFi SoftAP + served web page (telemetry + arm/launch/abort)
 │       │   └── wifi_link.cpp/.h
 │       ├── display/           # on-board OLED pad-status screens
 │       │   └── display.cpp/.h
 │       ├── state_machine/     # flight state machine + transitions
 │       │   └── state_machine.cpp/.h
-│       └── safety/            # cutoff checks (tilt/alt/battery/sensor-timeout)
+│       └── safety/            # hard failsafe (tilt / flight-time / sensor-timeout) + loop watchdog
 │           └── safety.cpp/.h
+├── web/                       # served control/telemetry page
+│   └── index.html             # also embedded in lib/wifi_link (keep in sync)
 ├── cad/                       # source CAD (airframe, mounts) + printables
 │   └── stl/
 │       ├── tvc-nozzle-70mm.stl
@@ -244,7 +267,7 @@ zephyr/
 │   └── flight_logs/           # one markdown file per test/flight
 │       └── _TEMPLATE.md       # copy to YYYY-MM-DD-<name>.md per event
 └── data/
-    └── flights/               # raw telemetry logs (.csv) recorded by the ground laptop
+    └── flights/               # raw telemetry logs (.csv)
 ```
 
 **Why the `firmware/` wrapper (and `platformio.ini` at the root):** SPARC uses this
@@ -261,24 +284,27 @@ reused between the two rockets.
 **Why `CLAUDE.md` is at the repo root:** agent tooling (Claude Code) auto-loads
 `CLAUDE.md` from the repository root. Keep it short — it should POINT to the docs,
 not duplicate them: toolchain/build commands, code conventions (all hardware
-constants live in `firmware/include/config.h`), and the safety-critical invariants
-(±12° deflection clamp, common ground, fan clamped during ESC tests, verify TVC
+constants live in `firmware/include/zephyr_config.h`), and the safety-critical invariants
+(deflection clamp `TVC_CLAMP_DEG`, common ground, fan clamped during ESC tests, verify TVC
 sign before free flight). It references `docs/build-guide.md` rather than containing
 it.
 
-**Key file: `firmware/include/config.h`** — keep ALL hardware-specific constants
-here (GPIO pin numbers, I2C addresses, PID gains, ±12° deflection limit, throttle
-min/max µs, arming duration). It lives in `include/` so every library and `main.cpp`
-can include it. One place to tune, nothing magic buried in logic.
+**Key file: `firmware/include/zephyr_config.h`** — keep ALL hardware-specific
+constants here (GPIO pin numbers, I2C addresses, PID gains, deflection clamp `TVC_CLAMP_DEG`,
+throttle min/max µs, arming duration, battery divider + thresholds). It lives in
+`include/` so every library and `main.cpp` can include it. One place to tune,
+nothing magic buried in logic. (The name is `zephyr_config.h`, not `config.h`, to
+avoid colliding with the `config.h` several Arduino libraries ship.)
 
 **No `test/` directory:** like SPARC, Zephyr does bench bring-up by flashing the
 main firmware incrementally (see Part B, Step 2), not via the PlatformIO test
 runner. Physical verification — I2C scan, servo sweep, FAN-CLAMPED ESC test — is
 the real "test suite" and is captured in this guide and in `docs/flight_logs/`.
 
-**No ground-station firmware:** there is only ONE ESP32. Telemetry goes out over a
-WiFi SoftAP; a laptop joins it and records the UDP stream into `data/flights/`. No
-second board, no receiver firmware to maintain.
+**No ground-station firmware:** there is only ONE ESP32. It hosts a WiFi SoftAP and
+serves the control/telemetry page itself; a phone or laptop just opens it in a
+browser. No second board, no receiver firmware to maintain. The radio is a
+convenience layer in its own task — it can never gate the control loop.
 
 **Commit conventions:** follow Conventional Commits (`type(scope): summary`) with
 `scope` matching the `firmware/lib/` module names (`sensors`, `fusion`, `pid`,
@@ -295,13 +321,13 @@ consistent with SPARC.
 [ ] 3. Bench: all 3 sensors reading correctly
 [ ] 4. Build 5V power rail (common ground!)
 [ ] 5. Bench: ESC + motor, FAN CLAMPED, arming + throttle
-[ ] 6. Bench: WiFi SoftAP up, laptop receives UDP telemetry
+[ ] 6. Bench: WiFi SoftAP up, web page loads at 192.168.4.1 with live telemetry
 [ ] 7. Print TVC nozzle + bracket, sand + lube ball joint
-[ ] 8. Assemble TVC stage, set mechanical zero, verify ±12°
+[ ] 8. Assemble TVC stage, set mechanical zero, verify ±20° mechanical travel
 [ ] 9. Firmware: ESC arming sequence into pre-flight state
 [ ] 10. Firmware: port TVC control loop, verify deflection sign
 [ ] 11. Airframe integration (battery mid-body, wiring external, clean duct)
-[ ] 12. Recovery system bench-tested independently
+[ ] 12. Propulsive descent → cut verified on the test stand (fan clamped)
 [ ] 13. TEST STAND: pinned at CoM, PID tuning until stable
 [ ] 14. First free hop — low, open area, restrained until arm
 ```

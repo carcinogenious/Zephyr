@@ -22,18 +22,17 @@ typical, verify by weighing · **budget** = remainder backed out of the all-up t
 | MPU6050 (GY-521) | 3 | est. | |
 | VL53L1X (TOF400C) | 2.5 | est. | |
 | TVC servo — MG90S #1 (pitch) | 13.4 | est. | metal-gear MG90S |
-| TVC servo — MG90S #2 (yaw) | 13.4 | est. | |
+| TVC servo — MG90S #2 (roll) | 13.4 | est. | |
 | Gimbaled nozzle (printed) | 40 | est. | depends on material/infill |
 | Servo bracket / gimbal mount (printed) | 25 | est. | |
 | Pushrods + linkage hardware | 5 | est. | 1.2 mm steel + horns |
 | Wiring, XT60s, 5V rail, connectors | 30 | est. | |
-| Parachute + shock cord + recovery hw | 30 | est. | sized for ~1 kg |
-| **Subtotal (above)** | **~659** | | |
-| Airframe (tube, nose cone, bulkheads, intake ring, fins) | ~326 | budget | remainder to target |
+| **Subtotal (above)** | **~629** | | |
+| Airframe (tube, nose cone, bulkheads, intake ring, legs) | ~356 | budget | remainder to target; legs for propulsive landing |
 | **All-up weight (AUW) target** | **~985** | locked | design range 970–1000 g |
 
 The airframe line is a **budget, not a measurement**: it's whatever's left between
-the components and the ~985 g target. If the structure comes in over ~326 g, AUW
+the components and the ~985 g target. If the structure comes in over ~356 g, AUW
 rises and the T/W margins below shrink — track it.
 
 ## Thrust / weight
@@ -63,5 +62,5 @@ rises and the T/W margins below shrink — track it.
 
 ---
 **Gaps to fill (need from build):** measured masses for the ESC, Heltec, sensors,
-servos, printed parts, parachute, and the finished airframe. The two locked values
+servos, printed parts, and the finished airframe (incl. landing legs). The two locked values
 (EDF 178 g, battery 232 g) and the thrust figures come from the design summary.

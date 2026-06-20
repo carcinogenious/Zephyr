@@ -21,9 +21,9 @@ What this test is meant to prove. One or two sentences.
 ## Configuration
 - **Throttle profile:** open-loop ramp / closed-loop · launch throttle = __%
 - **PID gains (pitch):** Kp __ Ki __ Kd __
-- **PID gains (yaw):** Kp __ Ki __ Kd __
-- **TVC mechanical zero:** pitch __ µs · yaw __ µs
-- **Deflection sign verified?** pitch ☐  yaw ☐  (must be ✓ before any free flight)
+- **PID gains (roll):** Kp __ Ki __ Kd __
+- **TVC mechanical zero:** pitch __ µs · roll __ µs
+- **Deflection sign verified?** pitch ☐  roll ☐  (must be ✓ before any free flight)
 - **Mass (AUW):** __ g
 - **Other changes since last log:**
 
@@ -37,21 +37,27 @@ Reference build-guide Part D. Note any deviations.
 - [ ] Fan clamped (for any ESC/throttle bench test)
 - [ ] All 3 sensors reading correctly
 - [ ] ESC armed (beeps confirmed)
-- [ ] TVC ±12° travel, no binding
+- [ ] TVC full ±20° mechanical travel, no binding (firmware clamps to TVC_CLAMP_DEG)
 - [ ] Telemetry received on ground laptop
-- [ ] Recovery armed / staged (if applicable)
+- [ ] Landing zone clear & marked (propulsive touchdown — no chute)
 
 ## Procedure
 Step-by-step of what was actually done.
 
 ## Results
-- Max altitude: __ m
-- Max tilt: __ °
-- Flight/run time: __ s
 - Outcome: nominal / partial / abort / failure
 
+## Telemetry summary
+Paste the block from the WiFi control page (shown after landing) here — it is the
+auto-generated end-of-flight summary:
+
+<!-- paste from the "Flight summary" box at http://192.168.4.1 -->
+- Peak altitude: __ in
+- Max tilt: __ deg
+- Flight time: __ s
+
 ## Observations
-What happened, qualitatively. Sounds, oscillation, drift, recovery behavior.
+What happened, qualitatively. Sounds, oscillation, drift, descent + touchdown behavior.
 
 ## Anomalies & root cause
 | Symptom | Suspected cause | Confirmed? |

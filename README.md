@@ -15,16 +15,19 @@ controls its flight in real time, and does it on electric power:
 
 - **Electric ducted fan** — a 70mm 6S EDF (~2240 g thrust) means no consumables,
   no pressurized gas, and a throttle you can hold steady. Recharge and re-fly.
-- **Thrust vector control** — a 2-axis gimbaled nozzle tilts ±12° on two MG90S
+- **Thrust vector control** — a 2-axis gimbaled nozzle (±20° mechanical, clamped to
+  ±10° during tuning) on two MG90S
   servos to keep the rocket vertical, even at low speed where fins do nothing.
 - **ESC throttle with arming** — thrust is commanded over an ESC PWM signal
   (1000–2000µs), with a boot-time arming sequence before the fan can spin.
 - **Sensor fusion** — barometer, IMU, and a downward laser rangefinder fused for
   robust altitude and attitude estimation.
-- **WiFi telemetry** — the board hosts a SoftAP and streams flight data over UDP
-  to a ground laptop. One ESP32, no second radio, no second board.
-- **Autonomous state machine** — arms, launches, flies vertical under TVC, then
-  deploys a parachute at apogee for recovery.
+- **WiFi telemetry + control page** — the board hosts its own access point and
+  serves a phone/laptop page with live telemetry and arm / launch / abort
+  buttons. The radio runs in a separate task and can never gate the flight loop.
+  One ESP32, no second radio, no second board.
+- **Autonomous state machine** — arms, launches, flies vertical under TVC, hovers,
+  then lands itself propulsively under power (no parachute).
 
 ## How it relates to SPARC
 
@@ -36,18 +39,18 @@ them. The difference is propulsion:
 | Lift | 88g CO2 cartridge (~850 psi) | 70mm 6S EDF (~2240 g thrust) |
 | Throttle | servo + ball valve | ESC PWM signal |
 | Battery | 2S LiPo | 6S LiPo |
-| Recovery | propulsive soft landing | parachute at apogee |
-| Shared | Heltec WiFi LoRa 32 V3 · BMP388 + MPU6050 + VL53L1X · WiFi SoftAP telemetry · ±12° 2-axis TVC · OLED |
+| Shared | Heltec WiFi LoRa 32 V3 · BMP388 + MPU6050 + VL53L1X · WiFi SoftAP telemetry · 2-axis TVC · OLED · propulsive soft landing |
 
 ## Project structure
 
 ```
 zephyr/
 ├── firmware/      ESP32 flight controller (PlatformIO)
-│   ├── include/   config.h — all pins, gains, limits
+│   ├── include/   zephyr_config.h — all pins, gains, limits
 │   ├── src/       main.cpp — entry point
 │   └── lib/       modules: sensors, fusion, pid, tvc, throttle,
-│                  wifi_link, display, state_machine, safety
+│                  battery, wifi_link, display, state_machine, safety
+├── web/           served control/telemetry page (index.html)
 ├── cad/           airframe + mounts, STLs in cad/stl/
 ├── docs/          build guide, wiring, mass budget, BOM, flight logs
 ├── data/flights/  recorded telemetry (.csv)
@@ -67,7 +70,7 @@ firmware spec, and [`CLAUDE.md`](CLAUDE.md) for build commands and conventions.
 | TVC | 3D-printed gimbaled nozzle + 2× MG90S servos + 1.2mm steel pushrods |
 | Sensors | BMP388 (baro) + MPU6050 (IMU) + VL53L1X (ToF) |
 | Computer | Heltec WiFi LoRa 32 V3 (ESP32-S3) |
-| Telemetry | WiFi SoftAP + UDP to ground laptop |
+| Telemetry | WiFi SoftAP + served control/telemetry web page |
 | Power | one 6S battery; ESC BEC feeds a shared 5V rail (common ground) |
 
 All-up weight ~970–1000 g · bench T/W ~2.2 (~1.9 with intake loss) · hover ~45%.
@@ -89,8 +92,18 @@ pio run -t upload             # flash the Heltec over USB
 pio device monitor -b 115200  # serial monitor
 ```
 
-To watch telemetry, join the board's `Zephyr-Telemetry` SoftAP from a laptop and
-record the stream: `nc -ul 4210 > data/flights/$(date +%F)-hop.csv`.
+### Telemetry & control page
+
+The board hosts a WiFi access point and serves a control/telemetry page:
+
+1. Join the AP **`Zephyr-Telemetry`** (password `zephyr-flight`).
+2. Open **http://192.168.4.1** in a browser.
+
+The page shows live telemetry (vertical height, attitude, throttle, phase,
+sensor status) and has **ARM / LAUNCH / ABORT** buttons. After landing it shows a
+flight summary to paste into `docs/flight_logs/`. The page source is
+[`web/index.html`](web/index.html) (the firmware serves an embedded copy) — you
+can also open that file directly while joined to the AP.
 
 ## Flight profile
 
@@ -98,9 +111,9 @@ record the stream: `nc -ul 4210 > data/flights/$(date +%F)-hop.csv`.
 |-------|----------|---------|
 | Arm | ESC armed (idle) | nozzle centered, OLED status on pad |
 | Launch | ramp up | TVC active, hold vertical |
-| Flight | launch profile | TVC active, telemetry downlink |
-| Apogee | cut | deploy parachute (baro + IMU detect) |
-| Descent / landed | off | recovery; log dump |
+| Ascend / hover | launch profile | TVC active, telemetry downlink |
+| Descent | powered down-ramp | TVC active, controlled descent on ToF |
+| Landed | cut | motor off; soft touchdown, log dump |
 
 ## Safety
 

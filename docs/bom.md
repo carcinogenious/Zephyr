@@ -29,32 +29,33 @@ summary; **purchase links and prices are TBD** — fill them in as you source pa
 
 | # | Item | Spec | Qty | Source | Price | Notes |
 |---|---|---|---:|---|---:|---|
-| 10 | TVC servos | MG90S metal-gear | 2 | TBD | TBD | pitch + yaw |
+| 10 | TVC servos | MG90S metal-gear | 2 | TBD | TBD | pitch + roll |
 | 11 | Gimbaled nozzle | HoloModels 70mm TV nozzle STL, or Matzetas 360° scaled to 70mm | 1 | print | — | `cad/stl/tvc-nozzle-70mm.stl` |
 | 12 | Servo bracket / gimbal mount | printed | 1 | print | — | `cad/stl/servo-bracket.stl` |
 | 13 | Pushrods | 1.2 mm steel | 2 | TBD | TBD | + servo horns / clevises |
 | 14 | PTFE dry lube | for ball-joint surfaces | 1 | TBD | TBD | sand joint first |
 
-## Airframe & recovery
+## Airframe
+
+Landing is propulsive — no parachute, shock cord, or deploy actuator. The lower
+airframe / legs absorb the low-speed powered touchdown instead.
 
 | # | Item | Spec | Qty | Source | Price | Notes |
 |---|---|---|---:|---|---:|---|
 | 15 | Body tube | sized for 70mm EDF + duct | 1 | TBD | TBD | inlet area ≥ fan area (~38 cm²) |
-| 16 | Nose cone | — | 1 | TBD | TBD | houses chute |
+| 16 | Nose cone | — | 1 | TBD | TBD | aerodynamic; no chute bay |
 | 17 | Bulkheads / centering | — | as req'd | TBD | TBD | |
-| 18 | Parachute | sized for ~1 kg, safe descent rate | 1 | TBD | TBD | |
-| 19 | Shock cord + recovery hardware | — | 1 | TBD | TBD | |
-| 20 | Recovery trigger | servo or MOSFET release | 1 | TBD | TBD | driven by GPIO 26 |
+| 18 | Landing legs / skid | absorbs powered touchdown | 1 set | TBD | TBD | propulsive landing |
 
 ## Electrical / assembly
 
 | # | Item | Spec | Qty | Source | Price | Notes |
 |---|---|---|---:|---|---:|---|
-| 21 | 5V rail | perfboard strip / servo Y-harness / star | 1 | TBD | TBD | shared node, common ground |
-| 22 | Hookup wire | silicone, appropriate gauge | — | TBD | TBD | fat path heavier gauge |
-| 23 | Buzzer + status LED | 5V/3.3V | 1 ea | TBD | TBD | GPIO 19 / 20 |
-| 24 | Battery divider resistors | e.g. 68k + 10k (ratio ~7.8) | 1 set | TBD | TBD | see wiring-diagram.md |
-| 25 | Push button | latching/momentary, for arm | 1 | TBD | TBD | GPIO 2, INPUT_PULLUP |
+| 19 | 5V rail | perfboard strip / servo Y-harness / star | 1 | TBD | TBD | shared node, common ground |
+| 20 | Hookup wire | silicone, appropriate gauge | — | TBD | TBD | fat path heavier gauge |
+| 21 | Battery divider resistors | 100k + 10k (ratio 11) | 1 set | TBD | TBD | 6S sense on GPIO 1; see wiring-diagram.md |
+| 22 | ESC signal level shifter | 74AHCT125N (MUST be AHCT/HCT) | 1 | TBD | TBD | 3.3→5V buffer so the ESC arms; see wiring-diagram.md |
+| 23 | Pulldown resistor | 10k | 1 | TBD | TBD | GPIO 6 → GND; holds buffer input low at boot |
 
 ---
 **Gaps to fill (need from you):** purchase links/vendors and prices for each TBD
