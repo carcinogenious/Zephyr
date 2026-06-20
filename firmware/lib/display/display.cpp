@@ -49,13 +49,17 @@ void display::message(const String& line1, const String& line2) {
     oled.display();
 }
 
-void display::sensorStatus(bool bmpOk, bool mpuOk, bool tofOk, float battV) {
+void display::sensorStatus(bool bmpOk, bool mpuOk, bool tofOk,
+                           float battV, float cellV, float pct, bool low) {
     oled.clear();
     oled.setFont(ArialMT_Plain_10);
     oled.drawString(0, 0,  String("BMP388  ") + (bmpOk ? "OK" : "FAIL"));
     oled.drawString(0, 11, String("MPU6050 ") + (mpuOk ? "OK" : "FAIL"));
     oled.drawString(0, 22, String("VL53L1X ") + (tofOk ? "OK" : "FAIL"));
-    oled.drawString(0, 33, String("Batt    ") + String(battV, 2) + "V");
+    oled.drawString(0, 33, String("Batt ") + String(battV, 1) + "V  "
+                                           + String(cellV, 2) + "/c");
+    oled.drawString(0, 44, low ? String("** LOW BATTERY **")
+                               : String("SOC  ") + String(pct, 0) + "%");
     oled.display();
 }
 

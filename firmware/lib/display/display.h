@@ -20,9 +20,11 @@ void init();
 // second line for a single centered line.
 void message(const String& line1, const String& line2 = String());
 
-// Pre-launch sensor/battery readout for the pad state. One line per sensor
-// + a final line for battery voltage.
-void sensorStatus(bool bmpOk, bool mpuOk, bool tofOk, float battV);
+// Pre-launch sensor/battery readout for the pad state. One line per sensor, then
+// the pack voltage + per-cell, and a final line with rough % charge — or a LOW
+// warning when low is true.
+void sensorStatus(bool bmpOk, bool mpuOk, bool tofOk,
+                  float battV, float cellV, float pct, bool low);
 
 // ARMED state: large "ARMED" banner with a countdown timer below.
 void armed(int countdownSec);
