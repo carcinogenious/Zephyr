@@ -1,0 +1,455 @@
+#include "wifi_link.h"
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <zephyr_config.h>
+
+namespace {
+WebServer server(80);
+
+// Shared state between the control loop (writer) and the web task (reader).
+// Guarded by a portMUX so a cross-core read can't tear. The critical sections
+// are a few microseconds — they never wait on the network.
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+wifi_link::Telemetry tlm{};
+bool haveTlm = false;
+
+float sumPeak = 0, sumTilt = 0, sumDur = 0;
+bool sumReady = false;
+
+volatile bool cmdArm = false, cmdLaunch = false, cmdAbort = false;
+
+// Latest manual throttle (0..1) from the page slider — a LEVEL the control loop
+// reads every cycle (not an edge). Single aligned float; guarded by the same mux
+// for consistency. Reset to 0 on ARM/ABORT so a flight never starts mid-slider.
+float manualThr = 0.0f;
+
+// Live attitude-PID gains, edited from the page. Seeded with the config defaults
+// by the control loop (seedGains), then read every cycle and applied. Guarded by
+// the same mux. Pitch and roll are independent.
+wifi_link::PidGains gPitch{}, gRoll{};
+
+// Served control + telemetry page. KEEP IN SYNC with web/index.html.
+const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ZEPHYR FLIGHT CONSOLE</title>
+<!-- Zephyr ground console. Canonical source: this file is mirrored byte-for-byte
+     into firmware/lib/wifi_link/wifi_link.cpp PAGE[]. Join the AP "Zephyr-Telemetry"
+     and open http://192.168.4.1, or open this file directly (it falls back to
+     192.168.4.1 over CORS). No external assets / fonts — works with no internet. -->
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+:root{
+ --lbl:'Arial Narrow','Roboto Condensed','Helvetica Neue',Arial,sans-serif;
+ --read:'Courier New',ui-monospace,monospace;
+ --amber:#eaa636;--green:#3ec85f;--red:#c33027;
+ --ink:#2a261c;--hi:rgba(255,250,235,.5);
+ --screen:#c8bd9f;
+}
+body{font-family:var(--lbl);color:var(--ink);padding:18px;min-height:100%;-webkit-text-size-adjust:100%;
+ display:flex;align-items:center;justify-content:center;
+ background:#0a0908;background-image:radial-gradient(120% 90% at 50% -10%,#1a1814,#060504 70%)}
+.console{width:100%;max-width:1160px;padding:18px 18px 14px;border:2px solid #0e0c08;border-radius:10px;
+ background-repeat:no-repeat;
+ background-image:
+  radial-gradient(circle at 16px 16px,#cabf9f 0 1.4px,#54493200 0,#544932 1.6px 4px,#0000 5px),
+  radial-gradient(circle at calc(100% - 16px) 16px,#cabf9f 0 1.4px,#544932 1.6px 4px,#0000 5px),
+  radial-gradient(circle at 16px calc(100% - 16px),#cabf9f 0 1.4px,#544932 1.6px 4px,#0000 5px),
+  radial-gradient(circle at calc(100% - 16px) calc(100% - 16px),#cabf9f 0 1.4px,#544932 1.6px 4px,#0000 5px),
+  repeating-linear-gradient(90deg,rgba(255,255,255,.02) 0 1px,rgba(0,0,0,.02) 1px 3px),
+  linear-gradient(168deg,#b7ae98 0%,#a99f88 52%,#b0a692 100%);
+ box-shadow:0 0 0 1px #2a2417,0 16px 40px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,250,235,.4),inset 0 -3px 10px rgba(0,0,0,.32)}
+.plate{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;padding:10px 14px;margin-bottom:14px;
+ border:1px solid #0b0906;border-radius:6px;
+ background:repeating-linear-gradient(90deg,rgba(255,255,255,.05) 0 1px,rgba(0,0,0,.06) 1px 2px),linear-gradient(180deg,#3c352a,#221c12);
+ box-shadow:inset 0 1px 0 rgba(255,225,170,.16),0 1px 3px rgba(0,0,0,.4)}
+.title{font-weight:700;letter-spacing:.34em;text-transform:uppercase;font-size:21px;line-height:1;color:#e6c98c;
+ text-shadow:0 1px 0 #000}
+.sub{display:block;margin-top:5px;font-size:10px;letter-spacing:.26em;color:#8d7a4f;text-transform:uppercase}
+.badge{text-align:right;font-family:var(--read);font-size:10px;letter-spacing:.16em;color:#9b885a;line-height:1.5}
+.deck{display:grid;grid-template-columns:1fr;gap:14px}
+.zone{position:relative;padding:17px 14px 14px;border:1px solid #14120d;border-radius:7px;
+ background:linear-gradient(168deg,#bcb39d,#a79d86);
+ box-shadow:inset 0 1px 0 var(--hi),inset 0 -3px 8px rgba(0,0,0,.16),0 2px 5px rgba(0,0,0,.28)}
+.ztitle{position:absolute;top:-9px;left:14px;padding:2px 9px;font-size:10px;letter-spacing:.24em;text-transform:uppercase;
+ color:#cdbf9a;border:1px solid #0c0a06;border-radius:3px;background:linear-gradient(180deg,#2c2519,#15110a);box-shadow:0 1px 2px rgba(0,0,0,.4)}
+.state{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 13px;
+ border:1px solid #000;border-radius:5px;background:radial-gradient(120% 130% at 50% -20%,#181208,#060402);
+ box-shadow:inset 0 2px 7px rgba(0,0,0,.85),inset 0 0 0 1px rgba(255,255,255,.03)}
+.statlbl{font-size:10px;letter-spacing:.22em;color:#6f6042;text-transform:uppercase}
+.modeval{font-family:var(--read);font-weight:700;font-size:23px;letter-spacing:.1em;color:var(--amber);text-shadow:0 0 6px rgba(234,166,54,.5)}
+.m1{color:#f4c84a;text-shadow:0 0 8px rgba(244,200,74,.6)}
+.m2{color:#f08a3b;text-shadow:0 0 8px rgba(240,138,59,.6)}
+.m3{color:#52d873;text-shadow:0 0 9px rgba(82,216,115,.6)}
+.bank{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+.meter{padding:7px 9px;border:1px solid #0c0a06;border-radius:4px;background:linear-gradient(180deg,#241e15,#16110a);
+ box-shadow:inset 0 1px 0 rgba(255,225,170,.1)}
+.lbl{font-size:9px;letter-spacing:.16em;color:#8f7c4f;text-transform:uppercase;margin-bottom:5px}
+.win{font-family:var(--read);font-weight:700;font-size:17px;color:var(--amber);padding:4px 8px;border:1px solid #000;border-radius:3px;
+ overflow:hidden;white-space:nowrap;background:radial-gradient(120% 150% at 50% -30%,#161009,#070503);
+ text-shadow:0 0 4px rgba(234,166,54,.45);box-shadow:inset 0 2px 5px rgba(0,0,0,.8)}
+.win.sm{font-size:13px;padding:3px 8px;display:inline-block}
+.lamps{display:flex;gap:8px;margin-top:9px}
+.lamp{flex:1;display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid #0c0a06;border-radius:4px;
+ background:linear-gradient(180deg,#241e15,#16110a);box-shadow:inset 0 1px 0 rgba(255,225,170,.08)}
+.led{width:11px;height:11px;border-radius:50%;flex:0 0 auto;border:1px solid #0a0805;background:#1a0a08;box-shadow:inset 0 1px 2px rgba(0,0,0,.8)}
+.led.ok{background:radial-gradient(circle at 35% 30%,#bdffca,var(--green) 62%,#0c7a2c);box-shadow:0 0 7px rgba(62,200,95,.75)}
+.led.bad{background:radial-gradient(circle at 35% 30%,#ff8b7a,var(--red) 62%,#5e0f0d);box-shadow:0 0 6px rgba(195,48,39,.6)}
+.lname{font-family:var(--read);font-size:10px;letter-spacing:.06em;color:#9a834f}
+.hazard{margin-top:11px;padding:6px 10px;text-align:center;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+ color:#1a1407;background:#e3ad27;border-top:3px solid;border-bottom:3px solid;
+ border-image:repeating-linear-gradient(45deg,#1a1407 0 8px,#e3ad27 8px 16px) 3}
+.block{margin-top:12px;padding:11px 12px;border:1px solid #4a4030;border-radius:6px;
+ background:linear-gradient(180deg,#c0b79f,#aaa089);box-shadow:inset 0 1px 0 var(--hi),0 1px 3px rgba(0,0,0,.22)}
+.blabel{display:block;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#3a3322;font-weight:700;text-shadow:0 1px 0 var(--hi)}
+.bhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:2px}
+input[type=range]{-webkit-appearance:none;appearance:none;background:transparent}
+.lever{width:100%;height:26px;margin:8px 0 3px}
+.lever::-webkit-slider-runnable-track{height:9px;border-radius:4px;background:linear-gradient(180deg,#0a0805,#1c160d);
+ box-shadow:inset 0 2px 4px rgba(0,0,0,.9),inset 0 0 0 1px rgba(255,255,255,.04)}
+.lever::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:30px;margin-top:-11px;border-radius:3px;border:1px solid #211a10;
+ background:linear-gradient(180deg,#e6d9b4,#9a8a64 52%,#5f5340);box-shadow:0 2px 4px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.6)}
+.lever::-moz-range-track{height:9px;border-radius:4px;background:#0a0805;box-shadow:inset 0 2px 4px rgba(0,0,0,.9)}
+.lever::-moz-range-thumb{width:18px;height:28px;border-radius:3px;border:1px solid #211a10;background:linear-gradient(180deg,#e6d9b4,#5f5340)}
+.scale{display:flex;justify-content:space-between;font-family:var(--read);font-size:9px;color:#5e5236;padding:0 1px}
+.trim{display:flex;align-items:center;gap:9px;margin-top:8px}
+.tn{width:62px;font-size:10px;letter-spacing:.08em;color:#3a3322;text-transform:uppercase;font-weight:700;text-shadow:0 1px 0 var(--hi)}
+.pot{flex:1;height:18px}
+.pot::-webkit-slider-runnable-track{height:5px;border-radius:3px;background:linear-gradient(180deg,#0a0805,#241c10);box-shadow:inset 0 1px 3px rgba(0,0,0,.9)}
+.pot::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;margin-top:-6px;border-radius:50%;border:1px solid #211a10;
+ background:radial-gradient(circle at 35% 30%,#ece0bd,#8a7a54 60%,#453a26);box-shadow:0 1px 2px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.5)}
+.pot::-moz-range-track{height:5px;border-radius:3px;background:#0a0805}
+.pot::-moz-range-thumb{width:15px;height:15px;border-radius:50%;border:1px solid #211a10;background:radial-gradient(circle at 35% 30%,#ece0bd,#453a26)}
+.din{width:54px;font-family:var(--read);font-weight:700;font-size:12px;color:var(--amber);text-align:right;padding:4px 6px;
+ border:1px solid #000;border-radius:3px;-moz-appearance:textfield;background:radial-gradient(120% 150% at 50% -30%,#161009,#070503);
+ text-shadow:0 0 4px rgba(234,166,54,.4);box-shadow:inset 0 2px 4px rgba(0,0,0,.8)}
+.din:focus{outline:1px solid var(--red)}
+.din::-webkit-outer-spin-button,.din::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.switchbank{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}
+.annun{flex:1;position:relative;border:2px solid #0b0906;cursor:pointer;border-radius:4px;padding:15px 6px 12px;
+ font-family:var(--lbl);font-weight:700;letter-spacing:.16em;text-transform:uppercase;font-size:14px;color:#bdb094;
+ background:linear-gradient(180deg,#3a3024,#1b150c);text-shadow:0 1px 1px #000;
+ box-shadow:0 3px 0 #0b0906,0 4px 7px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,225,170,.16)}
+.ann-lamp{position:absolute;top:6px;left:50%;transform:translateX(-50%);width:30px;height:4px;border-radius:2px;background:#150e05;box-shadow:inset 0 0 2px #000}
+.annun.amber.lit{color:#f6cf52;text-shadow:0 0 8px rgba(246,207,82,.8)}
+.annun.amber.lit .ann-lamp{background:#f4c23a;box-shadow:0 0 9px rgba(244,194,58,.9)}
+.annun.green.lit{color:#76ef9b;text-shadow:0 0 8px rgba(118,239,155,.8)}
+.annun.green.lit .ann-lamp{background:#4fe277;box-shadow:0 0 9px rgba(79,226,119,.9)}
+.annun:active{transform:translateY(3px);box-shadow:0 0 0 #0b0906,0 2px 4px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,225,170,.16)}
+.guard{flex:0 0 auto;padding:9px;border-radius:50%;background:radial-gradient(circle at 38% 30%,#8f8059,#211a10 72%);
+ box-shadow:0 3px 7px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,225,170,.28),inset 0 -3px 6px rgba(0,0,0,.4)}
+.dome{display:flex;align-items:center;justify-content:center;width:70px;height:70px;border:none;cursor:pointer;border-radius:50%;padding:0;
+ background:radial-gradient(circle at 40% 32%,#e8584c,#c33027 46%,#841511 100%);
+ box-shadow:0 5px 0 #4d0c0a,0 8px 12px rgba(0,0,0,.5),inset 0 2px 6px rgba(255,255,255,.35),inset 0 -8px 14px rgba(0,0,0,.45)}
+.dome span{font-family:var(--lbl);font-weight:700;letter-spacing:.08em;font-size:12px;color:#fff;text-transform:uppercase;text-shadow:0 1px 2px rgba(0,0,0,.6)}
+.dome:active{transform:translateY(3px);box-shadow:0 2px 0 #4d0c0a,0 4px 9px rgba(0,0,0,.55),inset 0 2px 6px rgba(255,255,255,.3),inset 0 -8px 14px rgba(0,0,0,.5)}
+.foot{margin-top:13px;text-align:center;font-family:var(--read);font-size:9px;letter-spacing:.18em;color:#5e5236;text-transform:uppercase}
+.printout{margin-top:13px}
+#sumtext{width:100%;height:96px;font-family:var(--read);font-size:11px;color:#9fe0b0;padding:8px;margin-top:8px;
+ border:1px solid #000;border-radius:4px;background:#080b08;box-shadow:inset 0 2px 6px rgba(0,0,0,.85);text-shadow:0 0 5px rgba(90,220,120,.4)}
+@media(min-width:860px){
+ .deck{grid-template-columns:1.02fr .98fr;align-items:start}
+ .modeval{font-size:25px}
+}
+</style></head><body>
+<div class="console">
+<header class="plate">
+<div><span class="title">Zephyr</span><span class="sub">TVC &middot; EDF Flight Console</span></div>
+<div class="badge">MK&middot;I<br>S/N 001<br>PAD CTRL</div>
+</header>
+<div class="deck">
+<section class="zone">
+<span class="ztitle">Telemetry</span>
+<div class="state"><span class="statlbl">Flight State</span><span class="modeval m0" id="mode">DISARMED</span></div>
+<div class="bank">
+<div class="meter"><div class="lbl">Vertical &middot; ToF</div><div class="win" id="vert">----</div></div>
+<div class="meter"><div class="lbl">Setpoint</div><div class="win" id="sp">----</div></div>
+<div class="meter"><div class="lbl">Pitch</div><div class="win" id="pitch">----</div></div>
+<div class="meter"><div class="lbl">Roll</div><div class="win" id="roll">----</div></div>
+<div class="meter"><div class="lbl">Throttle</div><div class="win" id="thr">0%</div></div>
+<div class="meter"><div class="lbl">Phase</div><div class="win" id="phase">IDLE</div></div>
+<div class="meter"><div class="lbl">Nozzle P / R</div><div class="win" id="def">-- / --</div></div>
+<div class="meter"><div class="lbl">Battery</div><div class="win" id="batt">0.0 V</div></div>
+</div>
+<div class="lamps">
+<div class="lamp"><span id="bmp" class="led bad"></span><span class="lname">BMP-388</span></div>
+<div class="lamp"><span id="mpu" class="led bad"></span><span class="lname">MPU-6050</span></div>
+<div class="lamp"><span id="tof" class="led bad"></span><span class="lname">VL53L1X</span></div>
+</div>
+</section>
+<section class="zone">
+<span class="ztitle">Flight Control</span>
+<div class="hazard">Caution &mdash; Fan Must Be Clamped For Any Bench Arm / Launch</div>
+<div class="block">
+<div class="bhead"><span class="blabel">Manual Throttle</span><span class="win sm" id="thrcmd">0%</span></div>
+<input type="range" id="thrSlide" class="lever" min="0" max="100" value="0" step="1">
+<div class="scale"><span>0</span><span>25</span><span>50</span><span>75</span><span>100</span></div>
+</div>
+<div class="block">
+<span class="blabel">Attitude Trim &mdash; PID</span>
+<div class="trim"><span class="tn">Pitch Kp</span><input id="pkp_s" class="pot" type="range" min="0" max="2" step="0.01"><input id="pkp" class="din" type="number" step="0.01"></div>
+<div class="trim"><span class="tn">Pitch Ki</span><input id="pki_s" class="pot" type="range" min="0" max="0.5" step="0.005"><input id="pki" class="din" type="number" step="0.005"></div>
+<div class="trim"><span class="tn">Pitch Kd</span><input id="pkd_s" class="pot" type="range" min="0" max="1" step="0.01"><input id="pkd" class="din" type="number" step="0.01"></div>
+<div class="trim"><span class="tn">Roll Kp</span><input id="rkp_s" class="pot" type="range" min="0" max="2" step="0.01"><input id="rkp" class="din" type="number" step="0.01"></div>
+<div class="trim"><span class="tn">Roll Ki</span><input id="rki_s" class="pot" type="range" min="0" max="0.5" step="0.005"><input id="rki" class="din" type="number" step="0.005"></div>
+<div class="trim"><span class="tn">Roll Kd</span><input id="rkd_s" class="pot" type="range" min="0" max="1" step="0.01"><input id="rkd" class="din" type="number" step="0.01"></div>
+</div>
+<div class="switchbank">
+<button id="arm" class="annun amber" onclick="cmd('arm')"><span class="ann-lamp"></span>Arm</button>
+<button id="launch" class="annun green" onclick="cmd('launch')"><span class="ann-lamp"></span>Launch</button>
+<div class="guard"><button id="abort" class="dome" onclick="cmd('abort')"><span>Abort</span></button></div>
+</div>
+</section>
+</div>
+<div id="summary" class="block printout" style="display:none">
+<span class="blabel">Flight Log &mdash; Telemetry Summary</span>
+<textarea id="sumtext" readonly></textarea>
+</div>
+<div class="foot">100 Hz Control &middot; 2-Axis TVC &middot; ESP32-S3 &middot; Heltec V3</div>
+</div>
+<script>
+const BASE=location.protocol==='file:'?'http://192.168.4.1':'';
+const MODES=['DISARMED','ARMED','COUNTDOWN','FLYING'];
+const PHASES=['IDLE','ASCEND','HOVER','DESCEND','LANDED','MANUAL'];
+function set(id,v){document.getElementById(id).textContent=v;}
+function cmd(c){if(c==='arm'||c==='abort'){thrSlide.value=0;set('thrcmd','0%');sendThr(0);}fetch(BASE+'/cmd?c='+c).catch(()=>{});}
+const thrSlide=document.getElementById('thrSlide');
+let thrPending=null,thrTimer=null;
+function sendThr(v){fetch(BASE+'/throttle?v='+v).catch(()=>{});}
+thrSlide.oninput=function(){set('thrcmd',this.value+'%');thrPending=this.value;
+ if(!thrTimer)thrTimer=setInterval(()=>{
+  if(thrPending!==null){sendThr(thrPending);thrPending=null;}
+  else{clearInterval(thrTimer);thrTimer=null;}},60);};
+const GAXES={pitch:['pkp','pki','pkd'],roll:['rkp','rki','rkd']};
+function sendGains(axis){const i=GAXES[axis];
+ fetch(BASE+'/gains?axis='+axis+'&kp='+document.getElementById(i[0]).value
+  +'&ki='+document.getElementById(i[1]).value
+  +'&kd='+document.getElementById(i[2]).value).catch(()=>{});}
+for(const axis in GAXES)GAXES[axis].forEach(id=>{
+ const n=document.getElementById(id),s=document.getElementById(id+'_s');
+ n.oninput=()=>{s.value=n.value;sendGains(axis);};
+ s.oninput=()=>{n.value=s.value;sendGains(axis);};});
+fetch(BASE+'/gains').then(r=>r.json()).then(g=>{
+ const st=(id,v)=>{document.getElementById(id).value=v;document.getElementById(id+'_s').value=v;};
+ st('pkp',g.pitch.kp);st('pki',g.pitch.ki);st('pkd',g.pitch.kd);
+ st('rkp',g.roll.kp);st('rki',g.roll.ki);st('rkd',g.roll.kd);}).catch(()=>{});
+function sns(id,ok){document.getElementById(id).className='led '+(ok?'ok':'bad');}
+async function poll(){
+ try{let t=await(await fetch(BASE+'/telemetry')).json();
+  const m=document.getElementById('mode');m.textContent=MODES[t.mode]||'---';m.className='modeval m'+t.mode;
+  set('vert',t.vert==null?'----':t.vert.toFixed(1)+' IN');
+  set('sp',t.sp==null?'----':t.sp.toFixed(1)+' IN');
+  set('pitch',t.pitch==null?'----':t.pitch.toFixed(1)+'°');
+  set('roll',t.roll==null?'----':t.roll.toFixed(1)+'°');
+  set('thr',t.thr.toFixed(0)+'%');
+  set('phase',PHASES[t.phase]||'---');
+  set('def',(t.defP==null?'--':t.defP.toFixed(1))+' / '+(t.defR==null?'--':t.defR.toFixed(1)));
+  set('batt',t.batt.toFixed(1)+' V');
+  sns('bmp',t.bmp);sns('mpu',t.mpu);sns('tof',t.tof);
+  document.getElementById('arm').classList.toggle('lit',t.mode>=1);
+  document.getElementById('launch').classList.toggle('lit',t.mode==3);
+ }catch(e){}
+ try{let s=await(await fetch(BASE+'/summary')).json();
+  if(s.ready){document.getElementById('summary').style.display='block';
+   document.getElementById('sumtext').value=
+    ['## Telemetry summary','- Peak altitude: '+s.peak.toFixed(1)+' in','- Max tilt: '+s.tilt.toFixed(1)+' deg','- Flight time: '+s.dur.toFixed(1)+' s',''].join(String.fromCharCode(10));}
+ }catch(e){}
+}
+setInterval(poll,250);poll();
+</script></body></html>)HTML";
+
+String num(float v) { return isnan(v) ? String("null") : String(v, 2); }
+
+void cors() { server.sendHeader("Access-Control-Allow-Origin", "*"); }
+
+void handleRoot() {
+    cors();
+    server.send_P(200, "text/html", PAGE);
+}
+
+void handleTelemetry() {
+    wifi_link::Telemetry t;
+    bool have;
+    taskENTER_CRITICAL(&mux);
+    t = tlm;
+    have = haveTlm;
+    taskEXIT_CRITICAL(&mux);
+
+    String s = "{";
+    s += "\"mode\":" + String(have ? t.flightMode : 0);
+    s += ",\"phase\":" + String(have ? t.phase : 0);
+    s += ",\"bmp\":" + String(t.bmpOk ? 1 : 0);
+    s += ",\"mpu\":" + String(t.mpuOk ? 1 : 0);
+    s += ",\"tof\":" + String(t.tofOk ? 1 : 0);
+    s += ",\"vert\":" + num(t.vertical_in);
+    s += ",\"sp\":" + num(t.setpoint_in);
+    s += ",\"pitch\":" + num(t.pitch_deg);
+    s += ",\"roll\":" + num(t.roll_deg);
+    s += ",\"thr\":" + String(t.throttlePct, 0);
+    s += ",\"defP\":" + num(t.defPitch_deg);
+    s += ",\"defR\":" + num(t.defRoll_deg);
+    s += ",\"batt\":" + String(t.battV, 1);
+    s += "}";
+    cors();
+    server.send(200, "application/json", s);
+}
+
+void handleSummary() {
+    float p, ti, d;
+    bool ready;
+    taskENTER_CRITICAL(&mux);
+    p = sumPeak; ti = sumTilt; d = sumDur; ready = sumReady;
+    taskEXIT_CRITICAL(&mux);
+    String s = "{\"ready\":" + String(ready ? 1 : 0) +
+               ",\"peak\":" + String(p, 1) +
+               ",\"tilt\":" + String(ti, 1) +
+               ",\"dur\":" + String(d, 1) + "}";
+    cors();
+    server.send(200, "application/json", s);
+}
+
+void handleCmd() {
+    String c = server.arg("c");
+    taskENTER_CRITICAL(&mux);
+    if (c == "arm")    { cmdArm = true;   manualThr = 0.0f; }  // start each flight at 0
+    if (c == "launch") cmdLaunch = true;
+    if (c == "abort")  { cmdAbort = true; manualThr = 0.0f; }  // abort drops the slider
+    taskEXIT_CRITICAL(&mux);
+    cors();
+    server.send(200, "text/plain", "ok");
+}
+
+// Manual throttle from the slider: /throttle?v=0..100 (percent). Stored as a
+// 0..1 fraction; the control loop applies compensation + protection downstream.
+void handleThrottle() {
+    float pct = server.arg("v").toFloat();
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    taskENTER_CRITICAL(&mux);
+    manualThr = pct / 100.0f;
+    taskEXIT_CRITICAL(&mux);
+    cors();
+    server.send(200, "text/plain", "ok");
+}
+
+// Attitude-PID gains. GET with no args → current gains as JSON (the page reads
+// this once to populate its inputs). GET with ?axis=pitch|roll&kp=&ki=&kd= →
+// store that axis's gains; the control loop applies them next cycle.
+void handleGains() {
+    if (!server.hasArg("axis")) {
+        wifi_link::PidGains p, r;
+        taskENTER_CRITICAL(&mux);
+        p = gPitch; r = gRoll;
+        taskEXIT_CRITICAL(&mux);
+        String s = "{\"pitch\":{\"kp\":" + String(p.kp, 3) +
+                   ",\"ki\":" + String(p.ki, 3) + ",\"kd\":" + String(p.kd, 3) +
+                   "},\"roll\":{\"kp\":" + String(r.kp, 3) +
+                   ",\"ki\":" + String(r.ki, 3) + ",\"kd\":" + String(r.kd, 3) + "}}";
+        cors();
+        server.send(200, "application/json", s);
+        return;
+    }
+    String axis = server.arg("axis");
+    wifi_link::PidGains g{server.arg("kp").toFloat(),
+                          server.arg("ki").toFloat(),
+                          server.arg("kd").toFloat()};
+    taskENTER_CRITICAL(&mux);
+    if (axis == "pitch")     gPitch = g;
+    else if (axis == "roll") gRoll = g;
+    taskEXIT_CRITICAL(&mux);
+    cors();
+    server.send(200, "text/plain", "ok");
+}
+
+void webTask(void*) {
+    for (;;) {
+        server.handleClient();
+        vTaskDelay(2 / portTICK_PERIOD_MS);
+    }
+}
+
+bool takeFlag(volatile bool& f) {
+    bool v;
+    taskENTER_CRITICAL(&mux);
+    v = f;
+    f = false;
+    taskEXIT_CRITICAL(&mux);
+    return v;
+}
+}  // namespace
+
+void wifi_link::init() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(cfg::WIFI_AP_SSID, cfg::WIFI_AP_PASS);
+    IPAddress ip = WiFi.softAPIP();
+
+    server.on("/", handleRoot);
+    server.on("/telemetry", handleTelemetry);
+    server.on("/summary", handleSummary);
+    server.on("/cmd", handleCmd);
+    server.on("/throttle", handleThrottle);
+    server.on("/gains", handleGains);
+    server.begin();
+
+    // Web/WiFi handling on core 0, off the control loop's core (1).
+    xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, nullptr, 0);
+
+    Serial.print(F("WiFi AP '"));
+    Serial.print(cfg::WIFI_AP_SSID);
+    Serial.print(F("'  pass "));
+    Serial.print(cfg::WIFI_AP_PASS);
+    Serial.print(F("  ->  http://"));
+    Serial.println(ip);
+}
+
+void wifi_link::publish(const Telemetry& t) {
+    taskENTER_CRITICAL(&mux);
+    tlm = t;
+    haveTlm = true;
+    taskEXIT_CRITICAL(&mux);
+}
+
+void wifi_link::publishSummary(float peakAlt_in, float maxTilt_deg, float duration_s) {
+    taskENTER_CRITICAL(&mux);
+    sumPeak = peakAlt_in;
+    sumTilt = maxTilt_deg;
+    sumDur = duration_s;
+    sumReady = true;
+    taskEXIT_CRITICAL(&mux);
+}
+
+bool wifi_link::takeArm()    { return takeFlag(cmdArm); }
+bool wifi_link::takeLaunch() { return takeFlag(cmdLaunch); }
+bool wifi_link::takeAbort()  { return takeFlag(cmdAbort); }
+
+float wifi_link::manualThrottle() {
+    float v;
+    taskENTER_CRITICAL(&mux);
+    v = manualThr;
+    taskEXIT_CRITICAL(&mux);
+    return v;
+}
+
+void wifi_link::seedGains(const PidGains& pitch, const PidGains& roll) {
+    taskENTER_CRITICAL(&mux);
+    gPitch = pitch;
+    gRoll = roll;
+    taskEXIT_CRITICAL(&mux);
+}
+
+wifi_link::PidGains wifi_link::pitchGains() {
+    PidGains g;
+    taskENTER_CRITICAL(&mux);
+    g = gPitch;
+    taskEXIT_CRITICAL(&mux);
+    return g;
+}
+
+wifi_link::PidGains wifi_link::rollGains() {
+    PidGains g;
+    taskENTER_CRITICAL(&mux);
+    g = gRoll;
+    taskEXIT_CRITICAL(&mux);
+    return g;
+}
