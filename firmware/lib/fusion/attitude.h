@@ -22,6 +22,13 @@ struct Attitude {
 Attitude update(float ax, float ay, float az,
                 float gx, float gy, float dt_s);
 
+// Accelerometer-only tilt (degrees) from the gravity vector — no gyro, no filter
+// state. The absolute, drift-free truth the filter's steady state must converge to.
+// Exposed for bench diagnostics: print this next to update()'s fused output and
+// they should agree at rest and track the same direction through a slow tilt. If
+// they move OPPOSITE ways, that axis's gyro/accel signs disagree (see attitude.cpp).
+Attitude accelOnly(float ax, float ay, float az);
+
 // Forget the filter state; the next update() re-seeds from the accelerometer.
 void reset();
 
