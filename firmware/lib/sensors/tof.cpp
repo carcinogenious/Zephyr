@@ -92,7 +92,8 @@ tof::Reading tof::read(float accel_x, float accel_y, float accel_z) {
 
     // Non-blocking: only consume a new sample if one is ready, otherwise
     // recompute the tilt correction on the last-known slant range so the
-    // loop keeps its 50 Hz cadence. A transaction that returns without an
+    // faster control loop never stalls on the ToF's ~50 Hz sample rate. A
+    // transaction that returns without an
     // I2C timeout proves the sensor is alive — even if its range_status
     // isn't Valid (e.g. target out of range) — so it refreshes the health
     // timestamp. Only a Valid measurement updates the cached range.
